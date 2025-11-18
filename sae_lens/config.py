@@ -190,6 +190,9 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     hook_name: str = "blocks.0.hook_mlp_out"
     hook_eval: str = "NOT_IN_USE"
     hook_head_index: int | None = None
+    hook_names_in: list[str] | None = None # new for crosscoder
+    hook_names_out: list[str] | None = None # new for crosscoder
+    d_model: int | None = None  # Base dimension per layer (e.g., 768 for GPT-2), new for crosscoder
     dataset_path: str = ""
     dataset_trust_remote_code: bool = True
     streaming: bool = True
@@ -274,6 +277,42 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
     exclude_special_tokens: bool | list[int] = False
 
     def __post_init__(self):
+        # new Validate crosscoder configuration
+        using_single_hook = self.hook_names_in is None and self.hook_names_out is None
+        using_multi_hook = self.hook_names_in is not None and self.hook_names_out is not None
+        
+        if not (using_single_hook or using_multi_hook):
+            raise ValueError(
+                "Either specify hook_name (for SAE) OR both hook_names_in and "
+                "hook_names_out (for crosscoder), not a mix of both."
+            )
+        
+        if using_multi_hook:
+            if self.d_model is None:
+                raise ValueError(
+                    "d_model is required when using hook_names_in/hook_names_out for crosscoders"
+                )
+            if not hasattr(self.sae, 'd_out'):
+                raise ValueError(
+                    "Multi-hook configuration requires a crosscoder config (e.g., CrosscoderConfig) "
+                    "with a d_out field. Standard SAE configs don't support multiple hooks."
+                )
+            # Validate dimensions match concatenated layers
+            expected_d_in = self.d_model * len(self.hook_names_in)
+            expected_d_out = self.d_model * len(self.hook_names_out)
+            if self.sae.d_in != expected_d_in:
+                raise ValueError(
+                    f"SAE d_in mismatch for crosscoder. Expected d_in={expected_d_in} "
+                    f"(d_model={self.d_model} × {len(self.hook_names_in)} input layers), "
+                    f"but got sae.d_in={self.sae.d_in}"
+                )
+            if self.sae.d_out != expected_d_out:
+                raise ValueError(
+                    f"SAE d_out mismatch for crosscoder. Expected d_out={expected_d_out} "
+                    f"(d_model={self.d_model} × {len(self.hook_names_out)} output layers), "
+                    f"but got sae.d_out={self.sae.d_out}"
+                )
+
         if self.hook_eval != "NOT_IN_USE":
             warnings.warn(
                 "The 'hook_eval' field is deprecated and will be removed in v7.0.0. "
@@ -496,7 +535,13 @@ class CacheActivationsRunnerConfig:
     model_batch_size: int
     hook_name: str
     d_in: int
-    training_tokens: int
+    # NEW: Multi-hook support for crosscoders
+    hook_names_in: list[str] | None = None
+    hook_names_out: list[str] | None = None
+    d_model: int | None = None
+    d_out: int | None = None
+    training_tokens: int = 10_000_000
+    # training_tokens: int
 
     context_size: int = -1  # Required if dataset is not tokenized
     model_class_name: str = "HookedTransformer"
@@ -528,6 +573,35 @@ class CacheActivationsRunnerConfig:
     dataset_trust_remote_code: bool | None = None
 
     def __post_init__(self):
+        # NEW: Validate crosscoder configuration
+        using_single_hook = self.hook_names_in is None and self.hook_names_out is None
+        using_multi_hook = self.hook_names_in is not None and self.hook_names_out is not None
+        
+        if not (using_single_hook or using_multi_hook):
+            raise ValueError(
+                "Either specify hook_name (for SAE) OR both hook_names_in and "
+                "hook_names_out (for crosscoder), not a mix of both."
+            )
+        
+        if using_multi_hook:
+            if self.d_model is None or self.d_out is None:
+                raise ValueError(
+                    "Both d_model and d_out are required when using hook_names_in/hook_names_out"
+                )
+            # Validate dimensions
+            expected_d_in = self.d_model * len(self.hook_names_in)
+            expected_d_out = self.d_model * len(self.hook_names_out)
+            if self.d_in != expected_d_in:
+                raise ValueError(
+                    f"d_in ({self.d_in}) must equal d_model ({self.d_model}) × "
+                    f"n_input_layers ({len(self.hook_names_in)}) = {expected_d_in}"
+                )
+            if self.d_out != expected_d_out:
+                raise ValueError(
+                    f"d_out ({self.d_out}) must equal d_model ({self.d_model}) × "
+                    f"n_output_layers ({len(self.hook_names_out)}) = {expected_d_out}"
+                )
+
         # Automatically determine context_size if dataset is tokenized
         if self.context_size == -1:
             ds = load_dataset(self.dataset_path, split="train", streaming=True)

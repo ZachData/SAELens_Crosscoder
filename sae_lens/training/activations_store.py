@@ -53,6 +53,11 @@ class ActivationsStore:
     _dataloader: Iterator[Any] | None = None
     exclude_special_tokens: torch.Tensor | None = None
     device: torch.device
+    # NEW: Crosscoder support
+    hook_names_in: list[str] | None = None
+    hook_names_out: list[str] | None = None
+    d_model: int | None = None
+    d_out: int | None = None
 
     @classmethod
     def from_cache_activations(
@@ -128,6 +133,13 @@ class ActivationsStore:
             streaming=cfg.streaming,
             hook_name=cfg.hook_name,
             hook_head_index=cfg.hook_head_index,
+            
+            # NEW: Add crosscoder parameters
+            hook_names_in=cfg.hook_names_in if hasattr(cfg, 'hook_names_in') else None,
+            hook_names_out=cfg.hook_names_out if hasattr(cfg, 'hook_names_out') else None,
+            d_model=cfg.d_model if hasattr(cfg, 'd_model') else None,
+            d_out=cfg.d_out if hasattr(cfg, 'd_out') else None,
+            
             context_size=cfg.context_size,
             d_in=cfg.d_in
             if isinstance(cfg, CacheActivationsRunnerConfig)
@@ -203,9 +215,6 @@ class ActivationsStore:
         dataset: HfDataset | str,
         streaming: bool,
         hook_name: str,
-        hook_head_index: int | None,
-        context_size: int,
-        d_in: int,
         n_batches_in_buffer: int,
         total_training_tokens: int,
         store_batch_size_prompts: int,
@@ -214,6 +223,16 @@ class ActivationsStore:
         normalize_activations: str,
         device: torch.device,
         dtype: str,
+        hook_head_index: int | None,
+        # NEW: Crosscoder parameters
+        hook_names_in: list[str] | None = None,
+        hook_names_out: list[str] | None = None,
+        d_model: int | None = None,
+        d_out: int | None = None,
+        context_size: int = 128,
+        d_in: int = 512,
+        # context_size: int,
+        # d_in: int,
         cached_activations_path: str | None = None,
         model_kwargs: dict[str, Any] | None = None,
         autocast_lm: bool = False,
@@ -249,6 +268,19 @@ class ActivationsStore:
 
         self.hook_name = hook_name
         self.hook_head_index = hook_head_index
+        # NEW: Handle crosscoder vs SAE mode
+        self.hook_names_in = hook_names_in
+        self.hook_names_out = hook_names_out
+        self.d_model = d_model
+        self.d_out = d_out if d_out is not None else d_in
+        
+        # Validate crosscoder configuration
+        if self.is_crosscoder:
+            if d_model is None:
+                raise ValueError("d_model is required for crosscoder mode")
+            if d_out is None:
+                raise ValueError("d_out is required for crosscoder mode")
+
         self.context_size = context_size
         self.d_in = d_in
         self.n_batches_in_buffer = n_batches_in_buffer
@@ -327,6 +359,57 @@ class ActivationsStore:
         self.cached_activation_dataset = self.load_cached_activation_dataset()
 
         # TODO add support for "mixed loading" (ie use cache until you run out, then switch over to streaming from HF)
+
+    @property
+    def is_crosscoder(self) -> bool:
+        """Whether this store is for crosscoder (multiple hooks)."""
+        return self.hook_names_in is not None and self.hook_names_out is not None
+    
+    @property
+    def all_hook_names(self) -> list[str]:
+        """All hooks to capture in model.run_with_cache."""
+        if self.is_crosscoder:
+            return self.hook_names_in + self.hook_names_out  # type: ignore
+        return [self.hook_name]
+    
+    def _process_hook_activations(
+        self,
+        layerwise_activations: torch.Tensor,
+        hook_head_index: int | None,
+        d: int,
+    ) -> torch.Tensor:
+        """
+        Helper to process activations from a single hook.
+        
+        Args:
+            layerwise_activations: Raw activations from hook
+            hook_head_index: Optional head index to select
+            d: Expected dimension after processing
+            
+        Returns:
+            Processed activations of shape (n_batches, n_context, d)
+        """
+        layerwise_activations = layerwise_activations[:, slice(*self.seqpos_slice)]
+        n_batches, n_context = layerwise_activations.shape[:2]
+        stacked_activations = torch.zeros((n_batches, n_context, d))
+        
+        if hook_head_index is not None:
+            stacked_activations[:, :] = layerwise_activations[:, :, hook_head_index]
+        elif layerwise_activations.ndim > 3:  # if we have a head dimension
+            try:
+                stacked_activations[:, :] = layerwise_activations.view(
+                    n_batches, n_context, -1
+                )
+            except RuntimeError as e:
+                logger.error(f"Error during view operation: {e}")
+                logger.info("Attempting to use reshape instead...")
+                stacked_activations[:, :] = layerwise_activations.reshape(
+                    n_batches, n_context, -1
+                )
+        else:
+            stacked_activations[:, :] = layerwise_activations
+        
+        return stacked_activations
 
     def _iterate_raw_dataset(
         self,
@@ -486,11 +569,15 @@ class ActivationsStore:
         return torch.stack(sequences, dim=0).to(_get_model_device(self.model))
 
     @torch.no_grad()
-    def get_activations(self, batch_tokens: torch.Tensor):
+    def get_activations(
+        self, batch_tokens: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
-        Returns activations of shape (batches, context, num_layers, d_in)
-
-        d_in may result from a concatenated head dimension.
+        Returns activations of shape (batches, context, d_in) for SAEs.
+        
+        For crosscoders, returns tuple of (acts_in, acts_out) where:
+            acts_in: (batches, context, d_model * n_input_layers)
+            acts_out: (batches, context, d_model * n_output_layers)
         """
         with torch.autocast(
             device_type="cuda",
@@ -499,41 +586,49 @@ class ActivationsStore:
         ):
             layerwise_activations_cache = self.model.run_with_cache(
                 batch_tokens,
-                names_filter=[self.hook_name],
-                stop_at_layer=extract_stop_at_layer_from_tlens_hook_name(
-                    self.hook_name
+                names_filter=self.all_hook_names,
+                stop_at_layer=max(
+                    extract_stop_at_layer_from_tlens_hook_name(h)
+                    for h in self.all_hook_names
                 ),
                 prepend_bos=False,
                 **self.model_kwargs,
             )[1]
 
-        layerwise_activations = layerwise_activations_cache[self.hook_name][
-            :, slice(*self.seqpos_slice)
-        ]
-
-        n_batches, n_context = layerwise_activations.shape[:2]
-
-        stacked_activations = torch.zeros((n_batches, n_context, self.d_in))
-
-        if self.hook_head_index is not None:
-            stacked_activations[:, :] = layerwise_activations[
-                :, :, self.hook_head_index
-            ]
-        elif layerwise_activations.ndim > 3:  # if we have a head dimension
-            try:
-                stacked_activations[:, :] = layerwise_activations.view(
-                    n_batches, n_context, -1
-                )
-            except RuntimeError as e:
-                logger.error(f"Error during view operation: {e}")
-                logger.info("Attempting to use reshape instead...")
-                stacked_activations[:, :] = layerwise_activations.reshape(
-                    n_batches, n_context, -1
-                )
-        else:
-            stacked_activations[:, :] = layerwise_activations
-
-        return stacked_activations
+        if not self.is_crosscoder:
+            # Standard SAE path
+            return self._process_hook_activations(
+                layerwise_activations_cache[self.hook_name],
+                self.hook_head_index,
+                self.d_in,
+            )
+        
+        # Crosscoder path: concatenate multiple layers
+        acts_in_list = []
+        for hook_name in self.hook_names_in:  # type: ignore
+            acts = self._process_hook_activations(
+                layerwise_activations_cache[hook_name],
+                hook_head_index=None,  # Crosscoders use full residual stream
+                d=self.d_model,  # type: ignore
+            )
+            acts_in_list.append(acts)
+        
+        acts_out_list = []
+        for hook_name in self.hook_names_out:  # type: ignore
+            acts = self._process_hook_activations(
+                layerwise_activations_cache[hook_name],
+                hook_head_index=None,
+                d=self.d_model,  # type: ignore
+            )
+            acts_out_list.append(acts)
+        
+        # Concatenate along feature dimension
+        # Each acts has shape [batch, context, d_model]
+        # Result: [batch, context, d_model * n_layers]
+        acts_in = torch.cat(acts_in_list, dim=-1)
+        acts_out = torch.cat(acts_out_list, dim=-1)
+        
+        return acts_in, acts_out
 
     def _load_buffer_from_cached(
         self,
@@ -541,58 +636,110 @@ class ActivationsStore:
         context_size: int,
         d_in: int,
         raise_on_epoch_end: bool,
-    ) -> tuple[
-        Float[torch.Tensor, "(total_size context_size) num_layers d_in"],
-        Int[torch.Tensor, "(total_size context_size)"] | None,
-    ]:
+    ) -> (
+        tuple[
+            Float[torch.Tensor, "(total_size context_size) d_in"],
+            Int[torch.Tensor, "(total_size context_size)"] | None,
+        ]
+        | tuple[
+            Float[torch.Tensor, "(total_size context_size) d_in"],
+            Float[torch.Tensor, "(total_size context_size) d_out"],
+            Int[torch.Tensor, "(total_size context_size)"] | None,
+        ]
+    ):
         """
         Loads `total_size` activations from `cached_activation_dataset`
 
         The dataset has columns for each hook_name,
         each containing activations of shape (context_size, d_in).
+        
+        For crosscoders, expects "acts_in" and "acts_out" columns.
 
         raises StopIteration
         """
         assert self.cached_activation_dataset is not None
-        # In future, could be a list of multiple hook names
-        if self.hook_name not in self.cached_activation_dataset.column_names:
-            raise ValueError(
-                f"Missing columns in dataset. Expected {self.hook_name}, "
-                f"got {self.cached_activation_dataset.column_names}."
-            )
-
+        
         if self.current_row_idx > len(self.cached_activation_dataset) - total_size:
             self.current_row_idx = 0
             if raise_on_epoch_end:
                 raise StopIteration
 
-        new_buffer = []
         ds_slice = self.cached_activation_dataset[
             self.current_row_idx : self.current_row_idx + total_size
         ]
-        # Load activations for each hook.
-        # Usually faster to first slice dataset then pick column
-        new_buffer = ds_slice[self.hook_name]
-        if new_buffer.shape != (total_size, context_size, d_in):
-            raise ValueError(
-                f"new_buffer has shape {new_buffer.shape}, "
-                f"but expected ({total_size}, {context_size}, {d_in})."
-            )
-
-        self.current_row_idx += total_size
-        acts_buffer = new_buffer.reshape(total_size * context_size, d_in)
-
-        if "token_ids" not in self.cached_activation_dataset.column_names:
-            return acts_buffer, None
-
-        token_ids_buffer = ds_slice["token_ids"]
-        if token_ids_buffer.shape != (total_size, context_size):
-            raise ValueError(
-                f"token_ids_buffer has shape {token_ids_buffer.shape}, "
-                f"but expected ({total_size}, {context_size})."
-            )
-        token_ids_buffer = token_ids_buffer.reshape(total_size * context_size)
-        return acts_buffer, token_ids_buffer
+        
+        if not self.is_crosscoder:
+            # Standard SAE: single hook column
+            if self.hook_name not in self.cached_activation_dataset.column_names:
+                raise ValueError(
+                    f"Missing columns in dataset. Expected {self.hook_name}, "
+                    f"got {self.cached_activation_dataset.column_names}."
+                )
+            
+            new_buffer = ds_slice[self.hook_name]
+            if new_buffer.shape != (total_size, context_size, d_in):
+                raise ValueError(
+                    f"new_buffer has shape {new_buffer.shape}, "
+                    f"but expected ({total_size}, {context_size}, {d_in})."
+                )
+            
+            self.current_row_idx += total_size
+            acts_buffer = new_buffer.reshape(total_size * context_size, d_in)
+            
+            if "token_ids" not in self.cached_activation_dataset.column_names:
+                return acts_buffer, None
+            
+            token_ids_buffer = ds_slice["token_ids"]
+            if token_ids_buffer.shape != (total_size, context_size):
+                raise ValueError(
+                    f"token_ids_buffer has shape {token_ids_buffer.shape}, "
+                    f"but expected ({total_size}, {context_size})."
+                )
+            token_ids_buffer = token_ids_buffer.reshape(total_size * context_size)
+            return acts_buffer, token_ids_buffer
+        
+        else:
+            # Crosscoder: acts_in and acts_out columns
+            if "acts_in" not in self.cached_activation_dataset.column_names:
+                raise ValueError(
+                    f"Missing 'acts_in' column in cached dataset. "
+                    f"Got columns: {self.cached_activation_dataset.column_names}"
+                )
+            if "acts_out" not in self.cached_activation_dataset.column_names:
+                raise ValueError(
+                    f"Missing 'acts_out' column in cached dataset. "
+                    f"Got columns: {self.cached_activation_dataset.column_names}"
+                )
+            
+            acts_in_buffer = ds_slice["acts_in"]
+            acts_out_buffer = ds_slice["acts_out"]
+            
+            if acts_in_buffer.shape != (total_size, context_size, d_in):
+                raise ValueError(
+                    f"acts_in_buffer has shape {acts_in_buffer.shape}, "
+                    f"but expected ({total_size}, {context_size}, {d_in})."
+                )
+            if acts_out_buffer.shape != (total_size, context_size, self.d_out):
+                raise ValueError(
+                    f"acts_out_buffer has shape {acts_out_buffer.shape}, "
+                    f"but expected ({total_size}, {context_size}, {self.d_out})."
+                )
+            
+            self.current_row_idx += total_size
+            acts_in_buffer = acts_in_buffer.reshape(total_size * context_size, d_in)
+            acts_out_buffer = acts_out_buffer.reshape(total_size * context_size, self.d_out)
+            
+            if "token_ids" not in self.cached_activation_dataset.column_names:
+                return acts_in_buffer, acts_out_buffer, None
+            
+            token_ids_buffer = ds_slice["token_ids"]
+            if token_ids_buffer.shape != (total_size, context_size):
+                raise ValueError(
+                    f"token_ids_buffer has shape {token_ids_buffer.shape}, "
+                    f"but expected ({total_size}, {context_size})."
+                )
+            token_ids_buffer = token_ids_buffer.reshape(total_size * context_size)
+            return acts_in_buffer, acts_out_buffer, token_ids_buffer
 
     @torch.no_grad()
     def get_raw_buffer(
@@ -600,13 +747,20 @@ class ActivationsStore:
         n_batches_in_buffer: int,
         raise_on_epoch_end: bool = False,
         shuffle: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor | None]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
+    ):
         """
         Loads the next n_batches_in_buffer batches of activations into a tensor and returns it.
 
         The primary purpose here is maintaining a shuffling buffer.
 
-        If raise_on_epoch_end is True, when the dataset it exhausted it will automatically refill the dataset and then raise a StopIteration so that the caller has a chance to react.
+        For SAEs: returns (activations, token_ids)
+        For crosscoders: returns (acts_in, acts_out, token_ids)
+
+        If raise_on_epoch_end is True, when the dataset it exhausted it will automatically 
+        refill the dataset and then raise a StopIteration so that the caller has a chance to react.
         """
         context_size = self.context_size
         batch_size = self.store_batch_size_prompts
@@ -619,49 +773,98 @@ class ActivationsStore:
             )
 
         refill_iterator = range(0, total_size, batch_size)
-        # Initialize empty tensor buffer of the maximum required size with an additional dimension for layers
-        new_buffer_activations = torch.zeros(
-            (total_size, self.training_context_size, d_in),
-            dtype=self.dtype,  # type: ignore
-            device=self.device,
-        )
-        new_buffer_token_ids = torch.zeros(
-            (total_size, self.training_context_size),
-            dtype=torch.long,
-            device=self.device,
-        )
-
-        for refill_batch_idx_start in tqdm(
-            refill_iterator, leave=False, desc="Refilling buffer"
-        ):
-            # move batch toks to gpu for model
-            refill_batch_tokens = self.get_batch_tokens(
-                raise_at_epoch_end=raise_on_epoch_end
-            ).to(_get_model_device(self.model))
-            refill_activations = self.get_activations(refill_batch_tokens)
-            # move acts back to cpu
-            refill_activations.to(self.device)
-            new_buffer_activations[
-                refill_batch_idx_start : refill_batch_idx_start + batch_size, ...
-            ] = refill_activations
-
-            # handle seqpos_slice, this is done for activations in get_activations
-            refill_batch_tokens = refill_batch_tokens[:, slice(*self.seqpos_slice)]
-            new_buffer_token_ids[
-                refill_batch_idx_start : refill_batch_idx_start + batch_size, ...
-            ] = refill_batch_tokens
-
-        new_buffer_activations = new_buffer_activations.reshape(-1, d_in)
-        new_buffer_token_ids = new_buffer_token_ids.reshape(-1)
-        if shuffle:
-            new_buffer_activations, new_buffer_token_ids = permute_together(
-                [new_buffer_activations, new_buffer_token_ids]
+        
+        if not self.is_crosscoder:
+            # Standard SAE path
+            new_buffer_activations = torch.zeros(
+                (total_size, self.training_context_size, d_in),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            new_buffer_token_ids = torch.zeros(
+                (total_size, self.training_context_size),
+                dtype=torch.long,
+                device=self.device,
             )
 
-        return (
-            new_buffer_activations,
-            new_buffer_token_ids,
-        )
+            for refill_batch_idx_start in tqdm(
+                refill_iterator, leave=False, desc="Refilling buffer"
+            ):
+                # move batch toks to gpu for model
+                refill_batch_tokens = self.get_batch_tokens(
+                    raise_at_epoch_end=raise_on_epoch_end
+                ).to(_get_model_device(self.model))
+                refill_activations = self.get_activations(refill_batch_tokens)
+                # move acts back to cpu
+                refill_activations = refill_activations.to(self.device)
+                new_buffer_activations[
+                    refill_batch_idx_start : refill_batch_idx_start + batch_size, ...
+                ] = refill_activations
+
+                # handle seqpos_slice, this is done for activations in get_activations
+                refill_batch_tokens = refill_batch_tokens[:, slice(*self.seqpos_slice)]
+                new_buffer_token_ids[
+                    refill_batch_idx_start : refill_batch_idx_start + batch_size, ...
+                ] = refill_batch_tokens
+
+            new_buffer_activations = new_buffer_activations.reshape(-1, d_in)
+            new_buffer_token_ids = new_buffer_token_ids.reshape(-1)
+            if shuffle:
+                new_buffer_activations, new_buffer_token_ids = permute_together(
+                    [new_buffer_activations, new_buffer_token_ids]
+                )
+
+            return (new_buffer_activations, new_buffer_token_ids)
+        
+        else:
+            # Crosscoder path: two activation tensors
+            new_buffer_acts_in = torch.zeros(
+                (total_size, self.training_context_size, d_in),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            new_buffer_acts_out = torch.zeros(
+                (total_size, self.training_context_size, self.d_out),
+                dtype=self.dtype,
+                device=self.device,
+            )
+            new_buffer_token_ids = torch.zeros(
+                (total_size, self.training_context_size),
+                dtype=torch.long,
+                device=self.device,
+            )
+
+            for refill_batch_idx_start in tqdm(
+                refill_iterator, leave=False, desc="Refilling buffer"
+            ):
+                refill_batch_tokens = self.get_batch_tokens(
+                    raise_at_epoch_end=raise_on_epoch_end
+                ).to(_get_model_device(self.model))
+                
+                acts_in, acts_out = self.get_activations(refill_batch_tokens)  # type: ignore
+                
+                new_buffer_acts_in[
+                    refill_batch_idx_start : refill_batch_idx_start + batch_size, ...
+                ] = acts_in.to(self.device)
+                new_buffer_acts_out[
+                    refill_batch_idx_start : refill_batch_idx_start + batch_size, ...
+                ] = acts_out.to(self.device)
+                
+                refill_batch_tokens = refill_batch_tokens[:, slice(*self.seqpos_slice)]
+                new_buffer_token_ids[
+                    refill_batch_idx_start : refill_batch_idx_start + batch_size, ...
+                ] = refill_batch_tokens
+
+            new_buffer_acts_in = new_buffer_acts_in.reshape(-1, d_in)
+            new_buffer_acts_out = new_buffer_acts_out.reshape(-1, self.d_out)
+            new_buffer_token_ids = new_buffer_token_ids.reshape(-1)
+            
+            if shuffle:
+                new_buffer_acts_in, new_buffer_acts_out, new_buffer_token_ids = permute_together(
+                    [new_buffer_acts_in, new_buffer_acts_out, new_buffer_token_ids]
+                )
+
+            return (new_buffer_acts_in, new_buffer_acts_out, new_buffer_token_ids)
 
     def get_filtered_buffer(
         self,

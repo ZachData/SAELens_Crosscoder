@@ -37,6 +37,11 @@ def _mk_activations_store(
         hook_head_index=None,
         context_size=cfg.context_size,
         d_in=cfg.d_in,
+        # NEW: Crosscoder parameters
+        hook_names_in=cfg.hook_names_in,
+        hook_names_out=cfg.hook_names_out,
+        d_model=cfg.d_model,
+        d_out=cfg.d_out,
         n_batches_in_buffer=cfg.n_batches_in_buffer,
         total_training_tokens=cfg.training_tokens,
         store_batch_size_prompts=cfg.model_batch_size,
@@ -51,7 +56,6 @@ def _mk_activations_store(
         dataset_trust_remote_code=cfg.dataset_trust_remote_code,
         seqpos_slice=cfg.seqpos_slice,
     )
-
 
 class CacheActivationsRunner:
     def __init__(
@@ -76,12 +80,24 @@ class CacheActivationsRunner:
         self.context_size = self._get_sliced_context_size(
             self.cfg.context_size, self.cfg.seqpos_slice
         )
-        features_dict: dict[str, Array2D | Sequence] = {
-            hook_name: Array2D(
+
+        # NEW: Handle both SAE and crosscoder feature schemas
+        features_dict: dict[str, Array2D | Sequence] = {}
+        
+        if self.cfg.hook_names_in is None:
+            # Standard SAE: single hook column
+            features_dict[self.cfg.hook_name] = Array2D(
                 shape=(self.context_size, self.cfg.d_in), dtype=self.cfg.dtype
             )
-            for hook_name in [self.cfg.hook_name]
-        }
+        else:
+            # Crosscoder: concatenated input and output columns
+            features_dict["acts_in"] = Array2D(
+                shape=(self.context_size, self.cfg.d_in), dtype=self.cfg.dtype
+            )
+            features_dict["acts_out"] = Array2D(
+                shape=(self.context_size, self.cfg.d_out), dtype=self.cfg.dtype
+            )
+        
         features_dict["token_ids"] = Sequence(  # type: ignore
             Value(dtype="int32"), length=self.context_size
         )
@@ -320,21 +336,64 @@ class CacheActivationsRunner:
         buffer: tuple[
             Float[torch.Tensor, "(bs context_size) d_in"],
             Int[torch.Tensor, "(bs context_size)"] | None,
+        ]
+        | tuple[
+            Float[torch.Tensor, "(bs context_size) d_in"],
+            Float[torch.Tensor, "(bs context_size) d_out"],
+            Int[torch.Tensor, "(bs context_size)"] | None,
         ],
     ) -> Dataset:
-        hook_names = [self.cfg.hook_name]
-        acts, token_ids = buffer
-        acts = einops.rearrange(
-            acts,
-            "(bs context_size) d_in -> bs context_size d_in",
-            bs=self.cfg.n_seq_in_buffer,
-            context_size=self.context_size,
-            d_in=self.cfg.d_in,
-        )
-        shard_dict: dict[str, object] = {
-            hook_name: act_batch
-            for hook_name, act_batch in zip(hook_names, [acts], strict=True)
-        }
+        """
+        Create a dataset shard from buffer.
+        
+        Handles two formats:
+        - SAE: (acts, token_ids)
+        - Crosscoder: (acts_in, acts_out, token_ids)
+        """
+        
+        if len(buffer) == 2:
+            # SAE format: (acts, token_ids)
+            acts, token_ids = buffer
+            acts = einops.rearrange(
+                acts,
+                "(bs context_size) d_in -> bs context_size d_in",
+                bs=self.cfg.n_seq_in_buffer,
+                context_size=self.context_size,
+                d_in=self.cfg.d_in,
+            )
+            hook_names = [self.cfg.hook_name]
+            shard_dict: dict[str, object] = {
+                hook_name: act_batch
+                for hook_name, act_batch in zip(hook_names, [acts], strict=True)
+            }
+        
+        elif len(buffer) == 3:
+            # Crosscoder format: (acts_in, acts_out, token_ids)
+            acts_in, acts_out, token_ids = buffer
+            acts_in = einops.rearrange(
+                acts_in,
+                "(bs context_size) d_in -> bs context_size d_in",
+                bs=self.cfg.n_seq_in_buffer,
+                context_size=self.context_size,
+                d_in=self.cfg.d_in,
+            )
+            acts_out = einops.rearrange(
+                acts_out,
+                "(bs context_size) d_out -> bs context_size d_out",
+                bs=self.cfg.n_seq_in_buffer,
+                context_size=self.context_size,
+                d_out=self.cfg.d_out,
+            )
+            shard_dict = {
+                "acts_in": acts_in,
+                "acts_out": acts_out,
+            }
+        
+        else:
+            raise ValueError(
+                f"Unexpected buffer format with {len(buffer)} elements. "
+                f"Expected 2 (SAE) or 3 (crosscoder) elements."
+            )
 
         if token_ids is not None:
             token_ids = einops.rearrange(
@@ -344,6 +403,7 @@ class CacheActivationsRunner:
                 context_size=self.context_size,
             )
             shard_dict["token_ids"] = token_ids.to(torch.int32)
+        
         return Dataset.from_dict(
             shard_dict,
             features=self.features,
