@@ -9,10 +9,14 @@ from sae_lens.saes import (
     SAE,
     BatchTopKTrainingSAE,
     BatchTopKTrainingSAEConfig,
+    Crosscoder,
+    CrosscoderConfig,
     GatedSAE,
     GatedSAEConfig,
     GatedTrainingSAE,
     GatedTrainingSAEConfig,
+    JumpReLUCrosscoder,
+    JumpReLUCrosscoderConfig,
     JumpReLUSAE,
     JumpReLUSAEConfig,
     JumpReLUTrainingSAE,
@@ -22,6 +26,8 @@ from sae_lens.saes import (
     MatryoshkaBatchTopKTrainingSAE,
     MatryoshkaBatchTopKTrainingSAEConfig,
     SAEConfig,
+    SkipCrosscoder,
+    SkipCrosscoderConfig,
     SkipTranscoder,
     SkipTranscoderConfig,
     StandardSAE,
@@ -105,6 +111,12 @@ __all__ = [
     "SkipTranscoderConfig",
     "JumpReLUTranscoder",
     "JumpReLUTranscoderConfig",
+    "Crosscoder",
+    "CrosscoderConfig",
+    "SkipCrosscoder",
+    "SkipCrosscoderConfig",
+    "JumpReLUCrosscoder",
+    "JumpReLUCrosscoderConfig",
     "MatryoshkaBatchTopKTrainingSAE",
     "MatryoshkaBatchTopKTrainingSAEConfig",
     "TemporalSAE",
@@ -131,4 +143,7 @@ register_sae_training_class(
 register_sae_class("transcoder", Transcoder, TranscoderConfig)
 register_sae_class("skip_transcoder", SkipTranscoder, SkipTranscoderConfig)
 register_sae_class("jumprelu_transcoder", JumpReLUTranscoder, JumpReLUTranscoderConfig)
+register_sae_class("crosscoder", Crosscoder, CrosscoderConfig)
+register_sae_class("skip_crosscoder", SkipCrosscoder, SkipCrosscoderConfig)
+register_sae_class("jumprelu_crosscoder", JumpReLUCrosscoder, JumpReLUCrosscoderConfig)
 register_sae_class("temporal", TemporalSAE, TemporalSAEConfig)

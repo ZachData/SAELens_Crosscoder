@@ -2,6 +2,14 @@ from .batchtopk_sae import (
     BatchTopKTrainingSAE,
     BatchTopKTrainingSAEConfig,
 )
+from .crosscoder import (
+    Crosscoder,
+    CrosscoderConfig,
+    JumpReLUCrosscoder,
+    JumpReLUCrosscoderConfig,
+    SkipCrosscoder,
+    SkipCrosscoderConfig,
+)
 from .gated_sae import (
     GatedSAE,
     GatedSAEConfig,
@@ -70,6 +78,12 @@ __all__ = [
     "SkipTranscoderConfig",
     "JumpReLUTranscoder",
     "JumpReLUTranscoderConfig",
+    "Crosscoder",
+    "CrosscoderConfig",
+    "SkipCrosscoder",
+    "SkipCrosscoderConfig",
+    "JumpReLUCrosscoder",
+    "JumpReLUCrosscoderConfig",
     "MatryoshkaBatchTopKTrainingSAE",
     "MatryoshkaBatchTopKTrainingSAEConfig",
     "TemporalSAE",
