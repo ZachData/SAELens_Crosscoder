@@ -9,14 +9,10 @@ from sae_lens.saes import (
     SAE,
     BatchTopKTrainingSAE,
     BatchTopKTrainingSAEConfig,
-    Crosscoder,
-    CrosscoderConfig,
     GatedSAE,
     GatedSAEConfig,
     GatedTrainingSAE,
     GatedTrainingSAEConfig,
-    JumpReLUCrosscoder,
-    JumpReLUCrosscoderConfig,
     JumpReLUSAE,
     JumpReLUSAEConfig,
     JumpReLUTrainingSAE,
@@ -26,8 +22,6 @@ from sae_lens.saes import (
     MatryoshkaBatchTopKTrainingSAE,
     MatryoshkaBatchTopKTrainingSAEConfig,
     SAEConfig,
-    SkipCrosscoder,
-    SkipCrosscoderConfig,
     SkipTranscoder,
     SkipTranscoderConfig,
     StandardSAE,
@@ -44,6 +38,20 @@ from sae_lens.saes import (
     TrainingSAEConfig,
     Transcoder,
     TranscoderConfig,
+
+    #crosscoder
+    Crosscoder,
+    CrosscoderConfig,
+    TrainingCrosscoder,
+    TrainingCrosscoderConfig,
+    JumpReLUCrosscoder,
+    JumpReLUCrosscoderConfig,
+    TrainingJumpReLUCrosscoder,
+    TrainingJumpReLUCrosscoderConfig,
+    SkipCrosscoder,
+    SkipCrosscoderConfig,
+    TrainingSkipCrosscoder,
+    TrainingSkipCrosscoderConfig,
 )
 
 from .analysis.hooked_sae_transformer import HookedSAETransformer
@@ -111,16 +119,24 @@ __all__ = [
     "SkipTranscoderConfig",
     "JumpReLUTranscoder",
     "JumpReLUTranscoderConfig",
-    "Crosscoder",
-    "CrosscoderConfig",
-    "SkipCrosscoder",
-    "SkipCrosscoderConfig",
-    "JumpReLUCrosscoder",
-    "JumpReLUCrosscoderConfig",
     "MatryoshkaBatchTopKTrainingSAE",
     "MatryoshkaBatchTopKTrainingSAEConfig",
     "TemporalSAE",
     "TemporalSAEConfig",
+
+    #crosscoder
+    "Crosscoder",
+    "CrosscoderConfig",
+    "TrainingCrosscoder",
+    "TrainingCrosscoderConfig",
+    "SkipCrosscoder",
+    "SkipCrosscoderConfig",
+    "TrainingSkipCrosscoder",
+    "TrainingSkipCrosscoderConfig",
+    "JumpReLUCrosscoder",
+    "JumpReLUCrosscoderConfig",
+    "TrainingJumpReLUCrosscoder",
+    "TrainingJumpReLUCrosscoderConfig",
 ]
 
 
@@ -140,10 +156,15 @@ register_sae_training_class(
     MatryoshkaBatchTopKTrainingSAE,
     MatryoshkaBatchTopKTrainingSAEConfig,
 )
+register_sae_class("temporal", TemporalSAE, TemporalSAEConfig)
 register_sae_class("transcoder", Transcoder, TranscoderConfig)
 register_sae_class("skip_transcoder", SkipTranscoder, SkipTranscoderConfig)
 register_sae_class("jumprelu_transcoder", JumpReLUTranscoder, JumpReLUTranscoderConfig)
-register_sae_class("crosscoder", Crosscoder, CrosscoderConfig)
-register_sae_class("skip_crosscoder", SkipCrosscoder, SkipCrosscoderConfig)
-register_sae_class("jumprelu_crosscoder", JumpReLUCrosscoder, JumpReLUCrosscoderConfig)
-register_sae_class("temporal", TemporalSAE, TemporalSAEConfig)
+
+#crosscoders
+register_sae_class(         "crosscoder", Crosscoder, CrosscoderConfig)
+register_sae_training_class("crosscoder", TrainingCrosscoder, TrainingCrosscoderConfig)
+register_sae_class(         "skip_crosscoder", SkipCrosscoder, SkipCrosscoderConfig)
+register_sae_training_class("skip_crosscoder", TrainingSkipCrosscoder, TrainingSkipCrosscoderConfig)
+register_sae_class(         "jumprelu_crosscoder", JumpReLUCrosscoder, JumpReLUCrosscoderConfig)
+register_sae_training_class("jumprelu_crosscoder", TrainingJumpReLUCrosscoder, TrainingJumpReLUCrosscoderConfig)

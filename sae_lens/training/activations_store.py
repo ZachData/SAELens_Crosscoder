@@ -127,6 +127,19 @@ class ActivationsStore:
             exclude_special_tokens = torch.tensor(
                 exclude_special_tokens, dtype=torch.long, device=device
             )
+
+        hook_names_in_raw = cfg.hook_names_in if hasattr(cfg, 'hook_names_in') else None
+        hook_names_out_raw = cfg.hook_names_out if hasattr(cfg, 'hook_names_out') else None
+
+        # Parse comma-separated strings
+        if hook_names_in_raw:
+            if isinstance(hook_names_in_raw, list) and len(hook_names_in_raw) == 1 and ',' in hook_names_in_raw[0]:
+                hook_names_in_raw = [h.strip() for h in hook_names_in_raw[0].split(',') if h.strip()]
+                
+        if hook_names_out_raw:
+            if isinstance(hook_names_out_raw, list) and len(hook_names_out_raw) == 1 and ',' in hook_names_out_raw[0]:
+                hook_names_out_raw = [h.strip() for h in hook_names_out_raw[0].split(',') if h.strip()]
+
         return cls(
             model=model,
             dataset=override_dataset or cfg.dataset_path,
@@ -135,10 +148,10 @@ class ActivationsStore:
             hook_head_index=cfg.hook_head_index,
             
             # NEW: Add crosscoder parameters
-            hook_names_in=cfg.hook_names_in if hasattr(cfg, 'hook_names_in') else None,
-            hook_names_out=cfg.hook_names_out if hasattr(cfg, 'hook_names_out') else None,
+            hook_names_in=hook_names_in_raw,
+            hook_names_out=hook_names_out_raw,
             d_model=cfg.d_model if hasattr(cfg, 'd_model') else None,
-            d_out=cfg.d_out if hasattr(cfg, 'd_out') else None,
+            d_out=cfg.sae.d_out if hasattr(cfg.sae, 'd_out') else None,
             
             context_size=cfg.context_size,
             d_in=cfg.d_in
@@ -363,7 +376,7 @@ class ActivationsStore:
     @property
     def is_crosscoder(self) -> bool:
         """Whether this store is for crosscoder (multiple hooks)."""
-        return self.hook_names_in is not None and self.hook_names_out is not None
+        return bool(self.hook_names_in) and bool(self.hook_names_out)
     
     @property
     def all_hook_names(self) -> list[str]:
@@ -871,7 +884,7 @@ class ActivationsStore:
         n_batches_in_buffer: int,
         raise_on_epoch_end: bool = False,
         shuffle: bool = True,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return _filter_buffer_acts(
             self.get_raw_buffer(
                 n_batches_in_buffer=n_batches_in_buffer,
@@ -881,7 +894,7 @@ class ActivationsStore:
             self.exclude_special_tokens,
         )
 
-    def _iterate_filtered_activations(self) -> Generator[torch.Tensor, None, None]:
+    def _iterate_filtered_activations(self) -> Generator[torch.Tensor | tuple[torch.Tensor, torch.Tensor], None, None]:
         """
         Iterate over the filtered tokens in the buffer.
         """
@@ -1013,19 +1026,30 @@ def _get_model_device(model: HookedRootModule) -> torch.device:
 
 
 def _filter_buffer_acts(
-    buffer: tuple[torch.Tensor, torch.Tensor | None],
+    buffer: tuple[torch.Tensor, torch.Tensor | None] | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None],
     exclude_tokens: torch.Tensor | None,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Filter out activations for tokens that are in exclude_tokens.
+    Handles both standard SAE (2-tuple) and crosscoder (3-tuple) cases.
     """
-
-    activations, tokens = buffer
-    if tokens is None or exclude_tokens is None:
-        return activations
-
-    mask = torch.isin(tokens, exclude_tokens)
-    return activations[~mask]
+    # Check if this is a crosscoder buffer (3 items) or standard buffer (2 items)
+    if len(buffer) == 3:
+        # Crosscoder case: (acts_in, acts_out, tokens)
+        acts_in, acts_out, tokens = buffer
+        if tokens is None or exclude_tokens is None:
+            return (acts_in, acts_out)
+        
+        mask = torch.isin(tokens, exclude_tokens)
+        return (acts_in[~mask], acts_out[~mask])
+    else:
+        # Standard SAE case: (activations, tokens)
+        activations, tokens = buffer
+        if tokens is None or exclude_tokens is None:
+            return activations
+        
+        mask = torch.isin(tokens, exclude_tokens)
+        return activations[~mask]
 
 
 def permute_together(tensors: Sequence[torch.Tensor]) -> tuple[torch.Tensor, ...]:

@@ -288,30 +288,30 @@ class LanguageModelSAERunnerConfig(Generic[T_TRAINING_SAE_CONFIG]):
             )
         
         if using_multi_hook:
-            if self.d_model is None:
-                raise ValueError(
-                    "d_model is required when using hook_names_in/hook_names_out for crosscoders"
-                )
+            # if self.d_model is None:
+            #     raise ValueError(
+            #         "d_model is required when using hook_names_in/hook_names_out for crosscoders"
+            #     )
             if not hasattr(self.sae, 'd_out'):
                 raise ValueError(
                     "Multi-hook configuration requires a crosscoder config (e.g., CrosscoderConfig) "
                     "with a d_out field. Standard SAE configs don't support multiple hooks."
                 )
             # Validate dimensions match concatenated layers
-            expected_d_in = self.d_model * len(self.hook_names_in)
-            expected_d_out = self.d_model * len(self.hook_names_out)
-            if self.sae.d_in != expected_d_in:
-                raise ValueError(
-                    f"SAE d_in mismatch for crosscoder. Expected d_in={expected_d_in} "
-                    f"(d_model={self.d_model} × {len(self.hook_names_in)} input layers), "
-                    f"but got sae.d_in={self.sae.d_in}"
-                )
-            if self.sae.d_out != expected_d_out:
-                raise ValueError(
-                    f"SAE d_out mismatch for crosscoder. Expected d_out={expected_d_out} "
-                    f"(d_model={self.d_model} × {len(self.hook_names_out)} output layers), "
-                    f"but got sae.d_out={self.sae.d_out}"
-                )
+            # expected_d_in = self.d_model * len(self.hook_names_in)
+            # expected_d_out = self.d_model * len(self.hook_names_out)
+            # if self.sae.d_in != expected_d_in:
+            #     raise ValueError(
+            #         f"SAE d_in mismatch for crosscoder. Expected d_in={expected_d_in} "
+            #         f"(d_model={self.d_model} × {len(self.hook_names_in)} input layers), "
+            #         f"but got sae.d_in={self.sae.d_in}"
+            #     )
+            # if self.sae.d_out != expected_d_out:
+            #     raise ValueError(
+            #         f"SAE d_out mismatch for crosscoder. Expected d_out={expected_d_out} "
+            #         f"(d_model={self.d_model} × {len(self.hook_names_out)} output layers), "
+            #         f"but got sae.d_out={self.sae.d_out}"
+            #     )
 
         if self.hook_eval != "NOT_IN_USE":
             warnings.warn(

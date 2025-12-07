@@ -7,18 +7,24 @@ This enables learning cross-layer features that can be causal, acausal, or mixed
 """
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
+import numpy as np
 import torch
 from torch import nn
 
+# from sae_lens.saes.jumprelu_sae import JumpReLU, Step, calculate_pre_act_loss
 from sae_lens.saes.sae import (
     SAE,
     SAEConfig,
     SAEMetadata,
+    TrainingSAE,
+    TrainingSAEConfig,
+    TrainStepInput,
+    TrainStepOutput,
+    TrainCoefficientConfig,
 )
 from sae_lens.util import filter_valid_dataclass_fields
-
 
 @dataclass
 class CrosscoderConfig(SAEConfig):
@@ -39,15 +45,18 @@ class CrosscoderConfig(SAEConfig):
         hook_names_out: List of output hook names (for metadata/validation)
     """
     # Output dimension fields
-    d_out: int = 768
-    d_model: int = 768
+    d_out: int | None = None
+    d_model: int | None = None
     n_input_layers: int = 1
     n_output_layers: int = 1
+    apply_b_dec_to_input: bool = False
     
     # Hook names for metadata
-    hook_names_in: list[str] | None = None
-    hook_names_out: list[str] | None = None
-    
+    from dataclasses import field
+
+    hook_names_in: str = ""
+    hook_names_out: str = ""
+
     @classmethod
     def architecture(cls) -> str:
         """Return the architecture name for this config."""
@@ -73,33 +82,51 @@ class CrosscoderConfig(SAEConfig):
             "d_model": self.d_model,
             "n_input_layers": self.n_input_layers,
             "n_output_layers": self.n_output_layers,
-            "hook_names_in": self.hook_names_in,
-            "hook_names_out": self.hook_names_out,
+            "hook_names_in": ",".join(self.hook_names_in) if isinstance(self.hook_names_in, list) else self.hook_names_in,
+            "hook_names_out": ",".join(self.hook_names_out) if isinstance(self.hook_names_out, list) else self.hook_names_out,
         })
         
         return res
     
     def __post_init__(self):
+        # Parse comma-separated hook names into lists
+        # Handle both str and list[str] inputs from parser
+        if isinstance(self.hook_names_in, str):
+            self.hook_names_in = [h.strip() for h in self.hook_names_in.split(",") if h.strip()]
+        elif isinstance(self.hook_names_in, list) and len(self.hook_names_in) == 1 and "," in self.hook_names_in[0]:
+            # Parser gave us ['hook1,hook2'] - split it
+            self.hook_names_in = [h.strip() for h in self.hook_names_in[0].split(",") if h.strip()]
+        elif not self.hook_names_in:
+            self.hook_names_in = []
+            
+        if isinstance(self.hook_names_out, str):
+            self.hook_names_out = [h.strip() for h in self.hook_names_out.split(",") if h.strip()]
+        elif isinstance(self.hook_names_out, list) and len(self.hook_names_out) == 1 and "," in self.hook_names_out[0]:
+            self.hook_names_out = [h.strip() for h in self.hook_names_out[0].split(",") if h.strip()]
+        elif not self.hook_names_out:
+            self.hook_names_out = []
+        
         if self.apply_b_dec_to_input:
             raise ValueError("apply_b_dec_to_input is not supported for crosscoders")
         
-        # Validate dimensions
-        expected_d_in = self.d_model * self.n_input_layers
+        # Skip dimensional validation if any required field is None (parser introspection mode)
+        if None in (self.d_in, self.d_sae, self.d_out, self.d_model, self.n_input_layers, self.n_output_layers):
+            return
+        
+        # Validate dimensions only when we have real values
         expected_d_out = self.d_model * self.n_output_layers
         
-        if self.d_in != expected_d_in:
-            raise ValueError(
-                f"d_in ({self.d_in}) must equal d_model ({self.d_model}) × "
-                f"n_input_layers ({self.n_input_layers}) = {expected_d_in}"
-            )
         if self.d_out != expected_d_out:
             raise ValueError(
                 f"d_out ({self.d_out}) must equal d_model ({self.d_model}) × "
                 f"n_output_layers ({self.n_output_layers}) = {expected_d_out}"
             )
         
-        return super().__post_init__()
-
+        # Call parent validation if it exists (handles multiple inheritance MRO)
+        try:
+            super().__post_init__()
+        except AttributeError:
+            pass
 
 class Crosscoder(SAE[CrosscoderConfig]):
     """
@@ -232,19 +259,17 @@ class Crosscoder(SAE[CrosscoderConfig]):
         cfg = CrosscoderConfig.from_dict(config_dict)
         return cls(cfg)
 
-
 @dataclass
-class SkipCrosscoderConfig(CrosscoderConfig):
-    """Configuration for crosscoder with skip connection."""
+class TrainingCrosscoderConfig(CrosscoderConfig, TrainingSAEConfig):
+    """Configuration for training a crosscoder."""
     
     @classmethod
     def architecture(cls) -> str:
-        """Return the architecture name for this config."""
-        return "skip_crosscoder"
+        return "crosscoder"
     
     @classmethod
-    def from_dict(cls, config_dict: dict[str, Any]) -> "SkipCrosscoderConfig":
-        """Create a SkipCrosscoderConfig from a dictionary."""
+    def from_dict(cls, config_dict: dict[str, Any]) -> "TrainingCrosscoderConfig":
+        """Create a TrainingCrosscoderConfig from a dictionary."""
         filtered_config_dict = filter_valid_dataclass_fields(config_dict, cls)
         res = cls(**filtered_config_dict)
         
@@ -253,174 +278,111 @@ class SkipCrosscoderConfig(CrosscoderConfig):
         
         return res
 
-
-class SkipCrosscoder(Crosscoder):
+class TrainingCrosscoder(Crosscoder, TrainingSAE[TrainingCrosscoderConfig]):
     """
-    A crosscoder with a learnable skip connection.
-
-    Implements: f(x) = W_dec @ relu(W_enc @ x + b_enc) + W_skip @ x + b_dec
+    Training version of Crosscoder.
     
-    The skip connection W_skip maps directly from concatenated input layers
-    to concatenated output layers, allowing the model to learn both sparse
-    features and direct linear transformations.
+    Extends the base Crosscoder with training-specific functionality including
+    encode_with_hidden_pre for accessing pre-activations during training.
     """
-
-    cfg: SkipCrosscoderConfig  # type: ignore[assignment]
-    W_skip: nn.Parameter
-
-    def __init__(self, cfg: SkipCrosscoderConfig):
+    
+    def __init__(self, cfg: TrainingCrosscoderConfig):
         super().__init__(cfg)
-        self.cfg = cfg
-
-        # Initialize skip connection matrix
-        # Shape: [d_out, d_in] to map from concatenated input to concatenated output
-        self.W_skip = nn.Parameter(
-            torch.zeros(self.cfg.d_out, self.cfg.d_in, dtype=self.dtype, device=self.device)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for skip crosscoder.
-
-        Args:
-            x: Concatenated input activations [batch, d_model * n_input_layers]
-
-        Returns:
-            sae_out: Concatenated output activations [batch, d_model * n_output_layers]
-        """
-        feature_acts = self.encode(x)
-        sae_out = self.decode(feature_acts)
-
-        # Add skip connection: x @ W_skip.T
-        # x has shape [batch, d_in], W_skip has shape [d_out, d_in]
-        skip_out = x @ self.W_skip.T.to(x.device)
-        return sae_out + skip_out
-
-    def forward_with_activations(
-        self,
-        x: torch.Tensor,
+    
+    def encode_with_hidden_pre(
+        self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass returning both output and feature activations.
-
-        Args:
-            x: Concatenated input activations [batch, d_model * n_input_layers]
-
-        Returns:
-            sae_out: Concatenated output activations [batch, d_model * n_output_layers]
-            feature_acts: Sparse feature activations [batch, d_sae]
-        """
-        feature_acts = self.encode(x)
-        sae_out = self.decode(feature_acts)
-
-        # Add skip connection
-        skip_out = x @ self.W_skip.T.to(x.device)
-        sae_out = sae_out + skip_out
-
-        return sae_out, feature_acts
-
-    @classmethod
-    def from_dict(cls, config_dict: dict[str, Any]) -> "SkipCrosscoder":
-        cfg = SkipCrosscoderConfig.from_dict(config_dict)
-        return cls(cfg)
-
-
-@dataclass
-class JumpReLUCrosscoderConfig(CrosscoderConfig):
-    """Configuration for JumpReLU crosscoder."""
-
-    @classmethod
-    def architecture(cls) -> str:
-        """Return the architecture name for this config."""
-        return "jumprelu_crosscoder"
-
-    @classmethod
-    def from_dict(cls, config_dict: dict[str, Any]) -> "JumpReLUCrosscoderConfig":
-        """Create a JumpReLUCrosscoderConfig from a dictionary."""
-        filtered_config_dict = filter_valid_dataclass_fields(config_dict, cls)
-        res = cls(**filtered_config_dict)
-
-        if "metadata" in config_dict:
-            res.metadata = SAEMetadata(**config_dict["metadata"])
-
-        return res
-
-
-class JumpReLUCrosscoder(Crosscoder):
-    """
-    A crosscoder with JumpReLU activation function.
-
-    JumpReLU applies a learned threshold to activations: if pre-activation
-    is below the threshold, the unit is zeroed out; otherwise, it follows
-    the base activation function (ReLU).
-    
-    This can lead to better sparsity and feature quality by allowing the
-    model to learn which features are "real" vs noise.
-    """
-
-    cfg: JumpReLUCrosscoderConfig  # type: ignore[assignment]
-    threshold: nn.Parameter
-
-    def __init__(self, cfg: JumpReLUCrosscoderConfig):
-        super().__init__(cfg)
-        self.cfg = cfg
-
-    def initialize_weights(self):
-        """Initialize crosscoder weights including threshold parameter."""
-        super().initialize_weights()
-
-        # Initialize threshold parameter for JumpReLU
-        # One threshold per feature in the sparse bottleneck
-        self.threshold = nn.Parameter(
-            torch.zeros(self.cfg.d_sae, dtype=self.dtype, device=self.device)
-        )
-
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Encode using JumpReLU activation.
-
-        Applies base activation function (ReLU) then masks based on learned threshold.
-        During training, the threshold is detached to prevent gradient flow.
+        Encode with access to pre-activation values for training.
         
         Args:
             x: Concatenated input activations [batch, d_model * n_input_layers]
         
         Returns:
             feature_acts: Sparse feature activations [batch, d_sae]
+            hidden_pre: Pre-activation values [batch, d_sae]
         """
         sae_in = self.process_sae_in(x)
-        hidden_pre = self.hook_sae_acts_pre(sae_in @ self.W_enc + self.b_enc)
-        
-        # Apply base activation function (ReLU)
+        hidden_pre = sae_in @ self.W_enc + self.b_enc
         feature_acts = self.activation_fn(hidden_pre)
-
-        # Apply JumpReLU threshold
-        # During training, use detached threshold to prevent gradient flow
-        threshold = self.threshold.detach() if self.training else self.threshold
-        jump_relu_mask = (hidden_pre > threshold).to(self.dtype)
-
-        # Apply mask and hook
-        return self.hook_sae_acts_post(feature_acts * jump_relu_mask)
-
-    def fold_W_dec_norm(self) -> None:
+        return feature_acts, hidden_pre
+    
+    def calculate_aux_loss(
+        self,
+        step_input: TrainStepInput,
+        feature_acts: torch.Tensor,
+        hidden_pre: torch.Tensor,
+        sae_out: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
         """
-        Fold the decoder weight norm into the threshold parameter.
-
-        This is important for JumpReLU as the threshold needs to be scaled
-        along with the decoder weights to maintain the same effective threshold.
+        Calculate auxiliary loss terms for training.
+        
+        For the basic crosscoder, no auxiliary losses are needed.
+        Subclasses can override this to add architecture-specific losses.
         """
-        # Get the decoder weight norms before normalizing
-        with torch.no_grad():
-            W_dec_norms = self.W_dec.norm(dim=1)
-
-        # Fold the decoder norms as in the parent class
-        super().fold_W_dec_norm()
-
-        # Scale the threshold by the decoder weight norms
-        with torch.no_grad():
-            self.threshold.data = self.threshold.data * W_dec_norms
-
+        return {}
+    
+    def get_coefficients(self) -> dict[str, float | TrainCoefficientConfig]:
+        """
+        Get loss coefficient configuration.
+        
+        For the basic crosscoder, no additional coefficients are needed.
+        """
+        return {}
+    
+    def decode(self, feature_acts: torch.Tensor) -> torch.Tensor:
+        """
+        Decode sparse features to concatenated multi-layer output.
+        
+        Overrides parent to match TrainingSAE interface expectations.
+        """
+        sae_out = feature_acts @ self.W_dec + self.b_dec
+        return self.hook_sae_recons(sae_out)
+    
     @classmethod
-    def from_dict(cls, config_dict: dict[str, Any]) -> "JumpReLUCrosscoder":
-        cfg = JumpReLUCrosscoderConfig.from_dict(config_dict)
+    def from_dict(cls, config_dict: dict[str, Any]) -> "TrainingCrosscoder":
+        cfg = TrainingCrosscoderConfig.from_dict(config_dict)
         return cls(cfg)
+    
+    
+    def training_forward_pass(
+        self,
+        step_input: TrainStepInput,
+    ) -> TrainStepOutput:
+        """Forward pass during training for crosscoder."""
+        feature_acts, hidden_pre = self.encode_with_hidden_pre(step_input.sae_in)
+        sae_out = self.decode(feature_acts)
+
+        # For crosscoders, reconstruct the target (output layer activations)
+        # not the input (input layer activations)
+        target = step_input.target if step_input.target is not None else step_input.sae_in
+        
+        # Calculate MSE loss
+        per_item_mse_loss = self.mse_loss_fn(sae_out, target)
+        mse_loss = per_item_mse_loss.sum(dim=-1).mean()
+
+        # Calculate architecture-specific auxiliary losses
+        aux_losses = self.calculate_aux_loss(
+            step_input=step_input,
+            feature_acts=feature_acts,
+            hidden_pre=hidden_pre,
+            sae_out=sae_out,
+        )
+
+        # Total loss is MSE plus all auxiliary losses
+        total_loss = mse_loss
+        losses = {"mse_loss": mse_loss}
+
+        if isinstance(aux_losses, dict):
+            losses.update(aux_losses)
+            for loss_value in aux_losses.values():
+                total_loss = total_loss + loss_value
+
+        return TrainStepOutput(
+            sae_in=step_input.sae_in,
+            sae_out=sae_out,
+            feature_acts=feature_acts,
+            hidden_pre=hidden_pre,
+            loss=total_loss,
+            losses=losses,
+        )

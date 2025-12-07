@@ -149,9 +149,8 @@ class SAEMetadata:
 @dataclass
 class SAEConfig(ABC):
     """Base configuration for SAE models."""
-
-    d_in: int
-    d_sae: int
+    d_in: int | None = None
+    d_sae: int | None = None
     dtype: str = "float32"
     device: str = "cpu"
     apply_b_dec_to_input: bool = True
@@ -184,17 +183,22 @@ class SAEConfig(ABC):
             )
         return res
 
-    def __post_init__(self):
-        if self.normalize_activations not in [
-            "none",
-            "expected_average_only_in",
-            "constant_norm_rescale",
-            "layer_norm",
-        ]:
-            raise ValueError(
-                f"normalize_activations must be none, expected_average_only_in, layer_norm, or constant_norm_rescale. Got {self.normalize_activations}"
-            )
-
+def __post_init__(self):
+    # Skip validation if d_in/d_sae are None (during parser introspection)
+    # done to force _parse_cfg_args() in llm_sae_trainign_runner to work for crosscoders
+    if self.d_in is None or self.d_sae is None:
+        return
+    
+    # Validate normalize_activations only when we have real values
+    if self.normalize_activations not in [
+        "none",
+        "expected_average_only_in",
+        "constant_norm_rescale",
+        "layer_norm",
+    ]:
+        raise ValueError(
+            f"normalize_activations must be none, expected_average_only_in, layer_norm, or constant_norm_rescale. Got {self.normalize_activations}"
+        )
 
 @dataclass
 class TrainStepOutput:
@@ -218,6 +222,7 @@ class TrainStepInput:
     coefficients: dict[str, float]
     dead_neuron_mask: torch.Tensor | None
     n_training_steps: int
+    target: torch.Tensor | None = None  # For crosscoders: reconstruction target
 
 
 class TrainCoefficientConfig(NamedTuple):

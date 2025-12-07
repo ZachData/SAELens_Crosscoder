@@ -170,11 +170,22 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         # Train loop
         while self.n_training_samples < self.cfg.total_training_samples:
             # Do a training step.
-            batch = next(self.data_provider).to(self.sae.device)
-            self.n_training_samples += batch.shape[0]
-            scaled_batch = self.activation_scaler(batch)
+            batch = next(self.data_provider)
 
-            step_output = self._train_step(sae=self.sae, sae_in=scaled_batch)
+            # Handle both standard SAE (single tensor) and crosscoder (tuple) batches
+            if isinstance(batch, tuple):
+                acts_in, acts_out = batch
+                acts_in = acts_in.to(self.sae.device)
+                acts_out = acts_out.to(self.sae.device)
+                self.n_training_samples += acts_in.shape[0]
+                scaled_batch_in = self.activation_scaler(acts_in)
+                step_output = self._train_step(sae=self.sae, sae_in=scaled_batch_in, target=acts_out)
+            else:
+                batch = batch.to(self.sae.device)
+                self.n_training_samples += batch.shape[0]
+                scaled_batch = self.activation_scaler(batch)
+                step_output = self._train_step(sae=self.sae, sae_in=scaled_batch)
+
 
             if self.cfg.logger.log_to_wandb:
                 self._log_train_step(step_output)
@@ -269,6 +280,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
         self,
         sae: T_TRAINING_SAE,
         sae_in: torch.Tensor,
+        target: torch.Tensor | None = None,
     ) -> TrainStepOutput:
         sae.train()
 
@@ -288,6 +300,7 @@ class SAETrainer(Generic[T_TRAINING_SAE, T_TRAINING_SAE_CONFIG]):
                     dead_neuron_mask=self.dead_neurons,
                     coefficients=self.get_coefficients(),
                     n_training_steps=self.n_training_steps,
+                    target=target,
                 ),
             )
 
